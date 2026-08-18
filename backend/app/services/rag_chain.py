@@ -18,12 +18,13 @@ from dotenv import load_dotenv
 
 from langchain_chroma import Chroma
 from langchain_core.chat_history import InMemoryChatMessageHistory
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import ToolMessage, HumanMessage, AIMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnableLambda, RunnableParallel
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_groq import ChatGroq
 from langchain_huggingface import HuggingFaceEmbeddings
+from typing import AsyncIterator
 
 from app.core.tools import query_recent_logs
 
@@ -134,6 +135,63 @@ conversational_rag = RunnableWithMessageHistory(
     input_messages_key="question",
     history_messages_key="history",
 )
+
+async def astream_answer(question:str, session_id: str) -> AsyncIterator[str]:
+    """
+    Real token-by-token streaming path for the FastAPI SSE endpoint.
+
+    `conversational_rag` above is invoke-only: its final step, `_run_chain`,
+    is a plain synchronous function, and LangChain cannot stream through a
+    plain function token-by-token — `.astream()` on it just runs the function
+    once and yields the whole result as a single chunk.
+
+    This function makes the same tool-decision call as `_run_chain` (still
+    blocking — its raw output is never shown to the user, so there's nothing
+    to stream there anyway), but the FINAL answer generation calls
+    `llm_with_tools.astream()` directly — the chat model object itself, which
+    natively supports token streaming — and yields each chunk as it arrives.
+
+    Cost of this design: two LLM calls minimum per request (one to decide on
+    a tool call, one to generate the streamed answer), even when no tool
+    fires. See docs/decisions.md for why this trade-off is acceptable at
+    Level 1's scale, and how Level 2's LangGraph nodes avoid it.
+
+    Session history is shared with `conversational_rag` via the same
+    `get_session_history` store, so the streaming endpoint and the
+    synchronous CLI/test path stay consistent within one session_id.
+    """
+    history = get_session_history(session_id)
+
+    docs = await retriever.ainvoke(question)
+    context = format_docs
+
+    messages= prompt.invoke(
+        {"context": context, "question": question, "history": history.messages}
+    ).to_messages()
+
+    ai_msg = await llm_with_tools.ainvoke(messages)
+
+    if ai_msg.tool_calls:
+        logger.info("Tool call(s) requested: %s", [tc["name"] for tc in ai_msg.tool_calls])
+        messages.append(ai_msg)
+        for tool_call in ai_msg.tool_calls:
+            tool_fn = tools_by_name.get(tool_call["name"])
+            result = (
+                await tool_fn.ainvoke(tool_call["args"])
+                if tool_fn else f"Unknown tool: {tool_call['name']}"
+            )
+            messages.append(ToolMessage(content=str(result), tool_call_id = tool_call["id"]))
+
+    full_text = ""
+    async for chunk in llm_with_tools.astream(messages):
+        piece = chunk.content or ""
+        if piece:
+            full_text += piece
+            yield piece
+
+
+    history.add_message(HumanMessage(content=question))
+    history.add_message(AIMessage(content=full_text))
 
 
 if __name__ == "__main__":
