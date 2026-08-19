@@ -43,7 +43,8 @@ embeddings = HuggingFaceEmbeddings(model_name = EMBEDDING_MODEL)
 vectorstore = Chroma(persist_directory=str(PERSIST_DIR), embedding_function=embeddings)
 retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
 
-llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
+# llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0) -> depricated
+llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0)
 tools=[query_recent_logs]
 tools_by_name = {t.name: t for t in tools}
 llm_with_tools = llm.bind_tools(tools)
